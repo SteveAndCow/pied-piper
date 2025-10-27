@@ -13,321 +13,121 @@ Original Paper for ImageGPT: [Generative Pretraining from Pixels (V2)](https://c
 HuggingFace Model Documentation for ImageGPT: [Transformers docs - ImageGPT](https://huggingface.co/docs/transformers/model_doc/imagegpt)
 
 
-# Task Breakdown
+## One-Day Blitz Plan
 
-Let’s treat this like a mini engineering sprint with four people. I’ll break it into 4 workstreams you can assign (A–D), list the concrete tasks in each stream, and call out dependencies / handoffs.
+**Duration:** 8:00 AM – 5:00 PM  
+**Team Size:** 4  
+**Goal:** Build a working demo of an **Image Compression System** using **ImageGPT**, adapted from our text-compression system.  
+By the end of the day we should have:
 
-High-level pipeline we’re building
-
-1. Load an image → preprocess into model tokens (per-channel sequences).
-2. Run ImageGPT to get predicted distributions over pixels.
-3. Use those predictions to compress (e.g. entropy code / bit length estimate).
-4. Report compression ratio across 10 random images.
-
-We need all four of those to exist by the end.
+- A working preprocessing → model → evaluation pipeline.
+- Compression ratios printed for 10 test images.
+- A simple visualization and README write-up.
 
 ---
 
-## Workstream A. Model + Research Owner (“Model / Arch lead”)
+### 🕒 Schedule Overview
 
-Goal: Understand and lock in how we’re using ImageGPT for compression.
-
-Tasks
-
-1. Read + summarize model behavior
-
-   * From the original paper and HuggingFace docs, confirm:
-
-     * What is ImageGPT expecting as input? (Tokenized pixel values? Quantized color codes? Shape `[seq_len]`?)
-     * Does it accept raw pixel intensities 0–255 or does it require clustering / codebook IDs first? (ImageGPT in the paper actually uses color quantization to 512 color codes in some variants, not raw RGB; you need to verify which checkpoint you’ll load. This affects preprocessing and sequence length.)
-     * What is the max context length actually supported by the checkpoint you’ll use (2048, per hint)?
-   * Output of this task: a short spec doc that others can depend on.
-
-2. Define compression formulation
-
-   * Decide how we estimate bits:
-
-     * We can treat ImageGPT as a probabilistic model and compute ideal code length = (-\sum \log_2 p(\text{pixel}_t | \text{pixels}<t)). That gives us an effective bits-per-pixel. This mirrors text compression with language models.
-     * Then Compression Ratio = (Uncompressed size in bits) / (Model-estimated code length in bits).
-   * Finalize formula and share it with Workstream D for reporting.
-
-3. Define sequence layout
-
-   * Are we doing channel-major? (All R flattened, then all G, then all B.)
-   * Or interleaved RGBRGB...?
-   * You’ll choose and write it down, because Workstream B must match it and Workstream C must reconstruct it.
-
-4. Context window policy
-
-   * For images whose flattened sequence > 2048 tokens:
-
-     * Option 1: restrict dataset to small images (e.g. 32×32, 64×64) so seq_len ≤ 2048.
-     * Option 2: tile the image into 32×32 crops and treat each tile independently.
-   * Make that call early, because it drives data prep (B) and evaluation batching (D).
-
-Deliverables / handoffs
-
-* A spec doc with:
-
-  * Input tokenization scheme
-  * Sequence ordering
-  * Image size constraint / tiling rule
-  * Bit-length math
-* Deadline: this spec unblocks literally everyone else.
-
-Blocking / dependencies
-
-* This has to happen first. Workstream B and C cannot start coding without this.
-
-Recommended person
-
-* Someone comfortable reading the ImageGPT paper + HF docs and making “we’re doing it this way” calls.
+| Time | Phase | Objective | Deliverable |
+|------|--------|------------|--------------|
+| **8:00 – 8:30 AM** | **Kickoff & Setup** | Align goals, assign initial roles, clone repo, install dependencies. | Verified environment, working project directory. |
+| **8:30 – 9:45 AM** | **Phase 1 – Model Sanity Check** | Load pretrained ImageGPT, test dummy forward pass, confirm logits shape. | Screenshot/log of successful model forward. |
+| **10:00 – 11:00 AM** | _(Meeting break)_ | Pause coding. Optional doc writing or reading ImageGPT paper. | — |
+| **11:00 – 12:30 PM** | **Phase 2 – Preprocessing Pipeline** | Load/resize 32×32 images, flatten into sequences, compute original bits. | Working `preprocess_image()` function. |
+| **12:30 – 1:30 PM** | _(Lunch + meeting)_ | Optional async doc updates. | — |
+| **1:30 – 3:00 PM** | **Phase 3 – Integration Sprint** | Feed preprocessed tokens into model, compute per-token log-probabilities and total bits. | End-to-end pipeline on 1–3 images. |
+| **3:00 – 3:15 PM** | **Sync + Role Rotation** | Quick regroup: assign new driver/navigator, list bugs. | Updated live task list. |
+| **3:15 – 4:15 PM** | **Phase 4 – Evaluation + Visualization** | Run on 10 images, compute compression ratios, plot results. | CSV + bar chart + average compression ratio. |
+| **4:15 – 5:00 PM** | **Phase 5 – Polish + Wrap-Up** | Clean code, finalize README, summarize learnings, optional slide prep. | Complete README + demo screenshot. |
 
 ---
 
-## Workstream B. Data + Preprocessing Owner (“Data engineer”)
+### 🧩 Core Task Checklist (MVP)
 
-Goal: Turn raw images into valid ImageGPT input tensors the model will accept.
+#### **Environment & Setup**
+- [ ] Install: `torch`, `transformers`, `Pillow`, `matplotlib`.
+- [ ] Verify GPU availability (`torch.cuda.is_available()`).
+- [ ] Load `openai/imagegpt-small` successfully.
+- [ ] Run dummy input test: check logits shape `[1, seq_len, vocab_size]`.
 
-Tasks
+#### **Preprocessing**
+- [ ] Load 10 sample images (e.g. CIFAR-10 or local folder).
+- [ ] Resize to 24×24 RGB (≈ 1728 tokens < 2048 context limit).
+- [ ] Flatten into single token sequence.
+- [ ] Compute `orig_bits = H × W × 3 × 8`.
+- [ ] Verify tensor shape matches model input.
 
-1. Image loader + dataset sampler
+#### **Model + Integration**
+- [ ] Forward tokens through model (`outputs = model(tokens)`).
+- [ ] Compute softmax → probabilities → `p_true`.
+- [ ] Compute `bits = -log2(p_true)` per token.
+- [ ] Sum to get total `compressed_bits`.
+- [ ] Compare `orig_bits` vs. `compressed_bits` for 1–3 images.
 
-   * Pick a source of ~10 random test images (CIFAR-10-style 32×32? Tiny ImageNet? personal folder?). Keep them local so we don’t need to train, just evaluate.
-   * Write code to:
+#### **Evaluation + Visualization**
+- [ ] Loop over all 10 images, store `(orig_bits, compressed_bits, ratio)`.
+- [ ] Compute averages + std deviation.
+- [ ] Plot bar chart with horizontal line at 1.0.
+- [ ] Save CSV and figure.
 
-     * Load each image
-     * Resize / center-crop to the agreed target size from A
-     * Convert to the model’s expected representation (quantized color indices or pixel intensities depending on A).
-
-2. Channel sequencing
-
-   * Split RGB into 3 channels if that’s what the model wants (per mentor hint).
-   * Flatten each channel to a 1D sequence.
-   * Concatenate sequences according to the layout from A.
-   * Produce final token sequence of length L ≤ context window.
-
-3. Batching & padding
-
-   * Prepare PyTorch tensors shaped like what HuggingFace ImageGPT forward() wants.
-   * Handle padding if some tiles are shorter than max length (and create attention masks if required).
-
-4. Metadata logging
-
-   * For each image/patch:
-
-     * Store original shape (H, W, 3)
-     * Store token sequence length
-     * Store raw size in bits (H×W×3×8).
-   * You’ll hand this to D.
-
-Deliverables / handoffs
-
-* `preprocess.py` with a function like:
-
-  ```python
-  def preprocess_image(img_path) -> {
-      "tokens": torch.LongTensor[1, L],
-      "orig_bits": int,
-      "H": int, "W": int
-  }
-  ```
-* A small script that loops over 10 images and dumps a list of these dicts to disk (pickle / JSON + npy).
-
-Blocking / dependencies
-
-* Needs Workstream A’s spec first (tokenization, tiling, ordering).
-* Unblocks Workstream C (model inference) and D (compression ratio calc).
-
-Recommended person
-
-* Someone comfortable with PIL / torchvision / numpy / PyTorch tensor wrangling.
+#### **Documentation**
+- [ ] Clean up code into: `preprocess.py`, `model_infer.py`, `run_demo.py`.
+- [ ] Update `README.md`:
+  - Pipeline overview diagram.
+  - Bits/compression formulas.
+  - Key design choices (token layout, image size, etc.).
+  - Limitations and next steps.
+- [ ] Add results table and sample plot.
 
 ---
 
-## Workstream C. Inference + Likelihood Owner (“Model runtime engineer”)
+### 🚀 Stretch Goals (Optional if Time Allows)
 
-Goal: Given a preprocessed sequence of tokens, run ImageGPT and compute per-token probabilities.
+- [ ] **Quantization Experiment:** Use ImageGPT’s 512-color quantizer instead of raw RGB.
+- [ ] **Grayscale Comparison:** Compare 1-channel vs. 3-channel compression efficiency.
+- [ ] **Tiling Larger Images:** Process 64×64 images by dividing into 24×24 patches.
+- [ ] **Entropy-Coding Simulation:** Convert predicted probs into actual byte lengths with arithmetic-coding formula.
+- [ ] **Reconstruction Demo (Pseudo):** Greedily sample pixels from model to reconstruct a rough image.
+- [ ] **Performance Benchmark:** Compare model-based bits/pixel to PNG/JPEG file size.
 
-Tasks
-
-1. Model load
-
-   * Using HuggingFace `AutoModelForCausalLM` or `ImageGPTForCausalLM` (depending on the exact class in docs), load the chosen pretrained ImageGPT checkpoint from HF.
-   * Put model in eval mode, no grad.
-
-2. Forward pass over sequence
-
-   * For each tokenized sequence from B:
-
-     * Feed into the model.
-     * Get logits for each position t.
-     * Convert logits[t-1] → probs for token[t] using softmax.
-
-       * Store (p_t = P(x_t | x_{<t})).
-
-   Note: first token doesn’t have a history; define how to handle it (A should specify, but usually you skip t=0 in the sum).
-
-3. Bits calculation per image
-
-   * Compute bits_t = -log2(p_t).
-   * Sum over t to get total_bits_model.
-   * Return that number.
-
-4. API / function boundary
-
-   * Expose a function like:
-
-     ```python
-     def evaluate_bits(tokens, model) -> float:
-         # returns compressed_bits for that image
-     ```
-   * This output + `orig_bits` from B goes to D.
-
-5. Efficiency considerations
-
-   * Watch out for long loops in Python. You may want to batch positions if possible (causal LM logits give you all next-token dists in one forward).
-   * GPU vs CPU: try GPU if you have it, but keep code CPU-safe for demo.
-
-Deliverables / handoffs
-
-* `inference.py` that:
-
-  * loads the model once,
-  * takes all preprocessed sequences,
-  * returns `compressed_bits`.
-
-Blocking / dependencies
-
-* Needs Workstream B’s output format (`tokens` tensor shape).
-* Needs Workstream A’s definition of how to treat padding, BOS tokens, etc.
-
-Recommended person
-
-* Someone comfy with PyTorch, softmax, log probs, GPU debug.
+*(If you run short on time, skip all stretch goals.)*
 
 ---
 
-## Workstream D. Metrics + Demo Owner (“Evaluation / Demo engineer”)
+### 👥 Pair-Work Fallback Plan (for Parallel Work)
 
-Goal: Tie it together and produce the final deliverable we show.
+If time runs tight, split into **two pairs** to parallelize:
 
-Tasks
+| Pair | Focus Area | Core Deliverables |
+|------|-------------|-------------------|
+| **Pair A – Model + Math** | - Load ImageGPT<br>- Test forward pass<br>- Compute per-token log-probs and bits | `model_infer.py` working for single image |
+| **Pair B – Data + Evaluation** | - Implement preprocessing<br>- Build 10-image loop<br>- Generate visualization and README | `preprocess.py`, plot, and table |
 
-1. Compression ratio calculator
-
-   * For each image i:
-
-     * Get `orig_bits_i` from B.
-     * Get `model_bits_i` from C.
-     * Compute:
-
-       * bits_per_pixel_original = orig_bits_i / (H_i * W_i)
-       * bits_per_pixel_model = model_bits_i / (H_i * W_i)
-       * compression_ratio = orig_bits_i / model_bits_i
-   * Store all of that in a table.
-
-2. Aggregate stats
-
-   * Compute averages across the 10 images:
-
-     * avg bits/pixel (raw vs model)
-     * avg compression ratio
-   * This is the headline number we report.
-
-3. Sanity checks / plotting
-
-   * Flag any images where model_bits > orig_bits (i.e. “compression ratio < 1”). That means “the model can’t beat raw PNG-style naive 8 bits/channel”, which is useful to talk about.
-   * Optional: simple matplotlib bar chart:
-
-     * x-axis = image index 1..10
-     * y-axis = compression ratio
-     * mark >1 good (<1 bad)
-   * Optional: dump a CSV of the table for slides.
-
-4. Demo script / README
-
-   * Write `run_demo.py` that:
-
-     * loads images list
-     * calls preprocess (B)
-     * calls inference (C)
-     * prints a nice table and averages
-   * Write `README.md` explaining:
-
-     * “How we tokenized”
-     * “How we estimated bits”
-     * “Final avg compression ratio on 10 random images”
-
-Deliverables / handoffs
-
-* Final report numbers
-* Demo script
-* README
-
-Blocking / dependencies
-
-* Needs outputs from B and C, plus formulas from A.
-
-Recommended person
-
-* Someone who’s good at presentation / storytelling and okay writing glue code.
+**Sync Points:**
+- *11:00 AM* – Agree on token format (tensor shape, dtype).  
+- *3:00 PM* – Integrate Pair A and B code paths and run first full pipeline test.  
+- *4:15 PM* – Finalize evaluation + documentation together.
 
 ---
 
-## Cross-cutting considerations (everyone should know)
+### ✅ Success Criteria (End-of-Day)
 
-1. Header / format definition
-
-   * Mentors said “need to define our own head of the compression format.”
-   * For this sprint demo, we don’t actually have to write a binary file format, but we *should* define in words:
-
-     * What metadata must be stored alongside the compressed stream? (image size, tiling info, quantization palette/codebook, maybe a checksum)
-     * How we’d decode (greedy sampling or arithmetic decoding using the same model probs).
-   * This explanation belongs in README (D) but depends on design choices from A.
-
-2. Decoding story
-
-   * Even if we don’t fully implement decompression, we should describe how it *would* work:
-
-     * Given the model and arithmetic coding, you could reconstruct pixel tokens sequentially because at each step the model predicts the next token distribution.
-   * That pitch makes the project feel “real compression,” not just math.
-
-3. Reproducibility
-
-   * Fix random seeds for image sampling so results are stable.
-   * Record model checkpoint version string.
-
-4. Division of labor sync
-
-   * A finishes spec first.
-   * Then B builds preprocessing and hands sample tensors to C to test forward().
-   * C returns per-image bit counts back to D.
-   * D runs final demo and writes README.
-   * While B/C/D are coding, A can work on the “format header / decoding story / limitations” writeup and review README.
+| Metric | Target |
+|---------|--------|
+| Pipeline runs end-to-end | ✅ on at least 10 images |
+| Compression ratio computed | ✅ (> 0, even if < 1) |
+| Plot generated | ✅ saved as `.png` |
+| README updated | ✅ includes design + results |
+| Code < 150 lines core logic | ✅ clean, readable |
+| Everyone understands each step | ✅ team learning goal met |
 
 ---
 
-## TL;DR Task Assignment Board
+### 📈 Notes on Scope and Feasibility
 
-**Person A — Modeling Spec / Compression Math**
+- This is a **conceptual compression demo**, not a production compressor.  
+- We expect total code ≈ 100 lines + glue.  
+- Avoid scope creep (no training, no reconstruction unless extra time).  
+- Focus on *pipeline correctness + understanding*.
 
-* Lock in tokenization, sequence layout, tiling policy, BOS/pad handling, bits formula.
-* Write mini-design doc + decoding story.
-
-**Person B — Preprocessing / Dataloader**
-
-* Implement `preprocess_image` to generate token sequences + metadata for 10 images.
-
-**Person C — Inference / Bit Calculator**
-
-* Load ImageGPT from HF.
-* For each token sequence, compute per-token probs and total compressed_bits.
-
-**Person D — Metrics / Demo / README**
-
-* Compute compression ratios.
-* Produce table, plot, averages.
-* Write `run_demo.py` and README with final numbers.
-
-That division should let all 4 people work mostly in parallel after A delivers the spec, and it ends with something demoable: “Here’s the average compression ratio of ImageGPT on 10 images, here’s how we did it.”
+---
