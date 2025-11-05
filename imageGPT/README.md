@@ -4,7 +4,15 @@ Image compression system using OpenAI's ImageGPT model and arithmetic coding for
 
 ## Overview
 
-This system compresses images by:
+This system compresses images using ImageGPT with two modes:
+
+### Lossless Mode (Default)
+1. **Channel Splitting**: Splits RGB image into separate R, G, B channels
+2. **Lossless Mapping**: Maps channel values 0-255 directly to vocab tokens 0-255 (no quantization)
+3. **Parallel Compression**: Compresses each channel separately (optionally in parallel)
+4. **Decompression**: Reconstructs original image with perfect pixel accuracy
+
+### Quantized Mode (Original)
 1. **Preprocessing**: Resizes images to 24×24 pixels and applies color quantization (16.7M colors → 512 clusters)
 2. **Tokenization**: Converts quantized pixels to token sequences using ImageGPT's vocabulary
 3. **Compression**: Uses ImageGPT's probability predictions with arithmetic coding to compress tokens
@@ -50,9 +58,43 @@ pip install -r requirements.txt
 
 ## Usage
 
+### Lossless Mode (Default - No Quantization)
+
+Compress images by splitting RGB channels and compressing each separately. This preserves all 256 values per channel (lossless):
+
 ```bash
+# Basic usage (lossless mode, default)
 python compress_image.py
+
+# Specify custom image
+python compress_image.py --image path/to/your/image.png
+
+# Disable parallel processing (sequential)
+python compress_image.py --no-parallel
+
+# Custom output filename
+python compress_image.py --image test.png --output my_compressed
 ```
+
+### Quantized Mode (Original ImageGPT Approach)
+
+Uses ImageGPT's color quantization (512 clusters):
+
+```bash
+# Quantized mode with default 24x24 size
+python compress_image.py --mode quantized
+
+# Custom image size
+python compress_image.py --mode quantized --size 32 32
+```
+
+### Command-Line Arguments
+
+- `--mode`: Compression mode - `lossless` (default) or `quantized`
+- `--image`: Path to input image (default: `test/pixel.png`)
+- `--output`: Output filename prefix (default: based on input image name)
+- `--no-parallel`: Disable parallel processing of channels (lossless mode only)
+- `--size HEIGHT WIDTH`: Target image size (default: `24 24`, only used in quantized mode)
 
 ### Output
 

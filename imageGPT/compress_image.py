@@ -8,46 +8,83 @@ import numpy as np
 import torch
 from transformers import AutoImageProcessor, ImageGPTForCausalImageModeling
 from PIL import Image
-from typing import Iterator
+from typing import Iterator, Tuple, List
 from arithmetic_coder import arithmetic_coder, ac_utils
-import matplotlib.pyplot as plt
 import os
 import time
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class Metric:
-    def __init__(self):
-        self.total_bits = 0.0
-        self.compressed_bits = 0.0
-
-    def compute_ratio(self):
-        if self.total_bits != 0 and self.compressed_bits != 0:
-            return (
-                self.total_bits / self.compressed_bits,
-                self.compressed_bits / self.total_bits,
-            )
-        else:
-            return 0, 0
-
-    def accumulate(self, compressed_bits, original_bits):
-        self.compressed_bits += compressed_bits
-        self.total_bits += original_bits
-
-
-def compress_image(compress_input, logits, metric, original_bits):
+def compress_channel_lossless(
+    channel_values: np.ndarray,
+    model,
+    device,
+    channel_name: str = "channel",
+    vocab_size: int = 512
+) -> Tuple[bytes, int, torch.Tensor, np.ndarray, torch.Tensor]:
     """
-    Compress image tokens using probability distribution from ImageGPT model.
+    Compress a single channel (R, G, or B) losslessly.
+    Maps channel values 0-255 directly to vocab tokens 0-255.
     
-    :param compress_input: image token sequence (with SOS token at start)
-    :param logits: model logits for next token prediction
-    :param metric: compression metrics
-    :param original_bits: original image bits (H × W × 3 × 8)
-    :return: compressed data and metadata
+    :param channel_values: 1D array of channel values (0-255), shape (H*W,)
+    :param model: ImageGPT model
+    :param device: device to run model on
+    :param channel_name: name of channel for logging
+    :param vocab_size: vocabulary size (512 for ImageGPT)
+    :return: (compressed_bytes, num_padded_bits, start_symbol, sequence_array, probs)
     """
+    # Map channel values 0-255 directly to tokens 0-255 (lossless)
+    # Pad tokens 256-511 with zero probability if needed
+    tokens = channel_values.astype(np.int64).copy()
+    
+    # Ensure tokens are in valid range [0, 255] for vocab mapping
+    tokens = np.clip(tokens, 0, 255)
+    
+    # Add SOS token (use 0 as SOS for simplicity, or vocab_size-1)
+    sos_token = np.array([vocab_size - 1])  # Use last vocab token as SOS
+    token_sequence = np.concatenate([sos_token, tokens])
+    
+    # Convert to tensor
+    input_ids = torch.tensor(token_sequence, dtype=torch.long, device=device).unsqueeze(0)
+    
+    # Get model predictions
+    with torch.no_grad():
+        position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=device).unsqueeze(0)
+        model_outputs = model(
+            input_ids=input_ids,
+            use_cache=False,
+            position_ids=position_ids,
+            past_key_values=None
+        )
+        # ImageGPT predicts next token, so we need logits[:-1] to match input_ids[1:]
+        logits = model_outputs.logits[:, :-1].to(torch.float32)
+    
+    # Get probabilities
+    probs = logits.softmax(dim=-1).to(torch.float32)
+    
+    # Create probability distribution for actual tokens (0-255)
+    # We'll restrict probabilities to first 256 tokens
+    probs_restricted = probs[:, :, :256]  # Only use first 256 tokens
+    probs_restricted_sum = probs_restricted.sum(dim=-1, keepdim=True)
+    probs_normalized = probs_restricted / (probs_restricted_sum + 1e-10)
+    
+    # Get actual sequence (excluding SOS)
+    sequence_array = tokens
+    sequence_tensor = input_ids[:, 1:]  # Exclude SOS
+    
+    # Get probability of true tokens
+    pd = torch.gather(probs_normalized, dim=-1, index=sequence_tensor.unsqueeze(-1)).squeeze(-1)
+    pd = pd.squeeze()
+    
+    # Compute theoretical compressed bits
+    compressed_bits_theoretical = -torch.sum(torch.log2(torch.clamp(pd, min=1e-10))).item()
+    
+    # Compress using arithmetic coding
     output = []
     encoder = arithmetic_coder.Encoder(
         base=2,
@@ -55,118 +92,89 @@ def compress_image(compress_input, logits, metric, original_bits):
         output_fn=output.append,
     )
     
-    # Save the first symbol (SOS token) for decoding
-    start_symbol = compress_input[:, :1]
+    probs_np = probs_normalized.squeeze(0).detach().cpu().numpy()  # [seq_len, 256]
+    if probs_np.ndim == 1:
+        probs_np = probs_np.reshape(1, -1)
     
-    # Get probabilities for the actual sequence (excluding SOS)
-    probs = logits.softmax(dim=-1).to(torch.float32)
-    sequence_array = compress_input[:, 1:].detach().cpu().numpy().reshape(-1)
+    for i, (symbol, prob) in enumerate(zip(sequence_array, probs_np)):
+        normalized_prob = ac_utils.normalize_pdf_for_arithmetic_coding(prob, np.float32)
+        encoder.encode(normalized_prob, int(symbol))
     
-    # Get probability of true tokens
-    pd = torch.gather(probs, dim=-1, index=compress_input[:, 1:].unsqueeze(-1)).squeeze(-1)
-    probs_np = np.vstack(probs.detach().cpu().numpy().squeeze())
-    pd = pd.squeeze()
-    
-    # Compute theoretical compressed bits using -log2(p_true)
-    compressed_bits_theoretical = -torch.sum(torch.log2(torch.clamp(pd, min=1e-10))).item()
-    
-    # Also use arithmetic coding for actual compression
-    for symbol, prob in zip(sequence_array, probs_np):
-        encoder.encode(
-            ac_utils.normalize_pdf_for_arithmetic_coding(prob, np.float32), symbol
-        )
     encoder.terminate()
-
+    
     # Convert to bytes
     compressed_bits_str = "".join(map(str, output))
     compressed_bytes, num_padded_bits = ac_utils.bits_to_bytes(compressed_bits_str)
-    compressed_bits_actual = len(compressed_bytes) * 8 + num_padded_bits
     
-    # Use theoretical bits for metric (as per instructions)
-    metric.accumulate(compressed_bits_theoretical, original_bits)
-
-    compress_rate, compress_ratio = metric.compute_ratio()
-    logger.info(f"Original bits: {original_bits:.2f}")
-    logger.info(f"Compressed bits (theoretical): {compressed_bits_theoretical:.2f}")
-    logger.info(f"Compressed bits (actual): {compressed_bits_actual:.2f}")
-    logger.info(f"Compression ratio: {compress_ratio:.6f}")
-    logger.info(f"Compression rate: {compress_rate:.6f}")
-
-    return compressed_bytes, num_padded_bits, start_symbol, sequence_array, pd, probs, compressed_bits_theoretical
+    start_symbol = input_ids[:, :1]  # SOS token
+    
+    logger.info(f"{channel_name}: {len(tokens)} tokens, "
+                f"compressed: {compressed_bits_theoretical:.2f} bits, "
+                f"actual: {len(compressed_bytes)*8+num_padded_bits:.2f} bits")
+    
+    return compressed_bytes, num_padded_bits, start_symbol, sequence_array, probs_normalized
 
 
-def decode_image(
-    compressed_bytes,
-    num_padded_bits,
+def decompress_channel_lossless(
+    compressed_bytes: bytes,
+    num_padded_bits: int,
     model,
-    start_symbol,
-    device,
-    original_seq_len,
-    original_sequence=None,
-    pd=None,
-    probs=None,
-    do_test=True,
-):
+    start_symbol: torch.Tensor,
+    device: torch.device,
+    original_seq_len: int,
+    stored_probs: torch.Tensor = None,
+    vocab_size: int = 512
+) -> np.ndarray:
     """
-    Decode compressed image tokens back to token sequence.
+    Decompress a single channel losslessly.
     
     :param compressed_bytes: compressed data
     :param num_padded_bits: padded bits
     :param model: ImageGPT model
-    :param start_symbol: SOS token to start decoding
+    :param start_symbol: SOS token
     :param device: device to run model on
     :param original_seq_len: original sequence length (excluding SOS)
-    :param original_sequence: original token sequence for testing
-    :param pd: probability distribution (for testing)
-    :param probs: probability arrays (for testing)
-    :param do_test: whether to print test information
-    :return: decoded token sequence including SOS token
+    :param stored_probs: stored probability distributions from encoding
+    :param vocab_size: vocabulary size (512 for ImageGPT)
+    :return: decompressed channel values (0-255)
     """
     # Convert bytes back to bit stream
     data_iter = iter(
         ac_utils.bytes_to_bits(compressed_bytes, num_padded_bits=num_padded_bits)
     )
-
-    # Utils function to read bits
+    
     def _input_fn(bit_sequence: Iterator[str] = data_iter) -> int | None:
         try:
             return int(next(bit_sequence))
         except StopIteration:
             return None
-
-    # Initialize a Decoder Object
+    
     decoder = arithmetic_coder.Decoder(
         base=2,
         precision=64,
         input_fn=_input_fn,
     )
-
+    
     # Start with SOS token
     sequence_array_de = start_symbol.squeeze(0).detach().cpu().numpy().copy()
     sequence_array_de_input = start_symbol.to(device)
-
-    # Prepare stored probability distributions if available
-    stored_probs = None
-    if probs is not None:
-        # Convert to numpy if it's a torch tensor
-        if isinstance(probs, torch.Tensor):
-            stored_probs = probs.detach().cpu().numpy()
-            if stored_probs.ndim == 3:  # [batch, seq_len, vocab]
-                stored_probs = stored_probs[0]  # Remove batch dimension
-        else:
-            stored_probs = probs
-        if stored_probs.ndim == 1:
-            stored_probs = stored_probs.reshape(1, -1)  # Ensure 2D
-
+    
+    # Prepare stored probability distributions
+    stored_probs_np = None
+    if stored_probs is not None:
+        stored_probs_np = stored_probs.detach().cpu().numpy()
+        if stored_probs_np.ndim == 3:
+            stored_probs_np = stored_probs_np[0]  # Remove batch dimension
+        if stored_probs_np.ndim == 1:
+            stored_probs_np = stored_probs_np.reshape(1, -1)
+    
     # Decode tokens one by one
     for i in range(original_seq_len):
         try:
-            # Use stored probability distribution if available, otherwise compute from model
-            if stored_probs is not None and i < stored_probs.shape[0]:
-                # Use the stored probability distribution from encoding
-                prob_at_pos = stored_probs[i]
+            if stored_probs_np is not None and i < stored_probs_np.shape[0]:
+                prob_at_pos = stored_probs_np[i, :256]  # Only first 256 tokens
             else:
-                # Fallback: compute from model (shouldn't happen if probs were passed)
+                # Fallback: compute from model
                 with torch.no_grad():
                     current_seq_len = sequence_array_de_input.shape[1]
                     position_ids = torch.arange(0, current_seq_len, dtype=torch.long, device=device).unsqueeze(0)
@@ -178,34 +186,37 @@ def decode_image(
                     )
                     logits = model_outputs.logits.to(torch.float32)
                 
-                # Get probability distribution for the last position
                 prob_de = logits.softmax(dim=-1).detach().cpu().numpy()
-                if prob_de.ndim == 3:  # [batch, seq_len, vocab]
-                    prob_at_pos = prob_de[0, -1, :]  # Last position of first batch
-                elif prob_de.ndim == 2:  # [seq_len, vocab]
-                    prob_at_pos = prob_de[-1, :]  # Last position
-                else:  # [vocab]
-                    prob_at_pos = prob_de
+                if prob_de.ndim == 3:
+                    prob_at_pos = prob_de[0, -1, :256]  # Last position, first 256 tokens
+                elif prob_de.ndim == 2:
+                    prob_at_pos = prob_de[-1, :256]
+                else:
+                    prob_at_pos = prob_de[:256]
+                
+                # Normalize to sum to 1
+                prob_sum = prob_at_pos.sum()
+                if prob_sum > 0:
+                    prob_at_pos = prob_at_pos / prob_sum
             
             # Normalize and decode
             normalized_prob = ac_utils.normalize_pdf_for_arithmetic_coding(prob_at_pos, np.float32)
             de_token = decoder.decode(normalized_prob)
             
-            # Append to the generated sequence
+            # Append to sequence
             sequence_array_de = np.append(sequence_array_de, de_token)
             
-            # Update input for next iteration - only needed if we're computing probs from model
-            # If using stored probs, we don't need to update the input
-            if stored_probs is None or i >= stored_probs.shape[0]:
+            # Update input for next iteration
+            if stored_probs_np is None or i >= stored_probs_np.shape[0]:
                 max_seq_len = min(len(sequence_array_de), model.config.n_positions)
                 sequence_array_de_input = torch.tensor(
-                    sequence_array_de[:max_seq_len], 
+                    sequence_array_de[-max_seq_len:], 
                     dtype=torch.long, device=device
                 ).unsqueeze(0)
             
         except StopIteration:
-            # If we run out of bits, use model's top prediction for remaining tokens
             logger.warning(f"Ran out of compressed bits at position {i}/{original_seq_len}")
+            # Use model's top prediction for remaining tokens
             remaining = original_seq_len - i
             with torch.no_grad():
                 for j in range(remaining):
@@ -219,301 +230,425 @@ def decode_image(
                     logits = model_outputs.logits.to(torch.float32)
                     prob_de = logits.softmax(dim=-1).detach().cpu().numpy().squeeze(0)
                     if prob_de.ndim == 2:
-                        de_token = prob_de[-1].argmax()
+                        de_token = prob_de[-1, :256].argmax()
                     else:
-                        de_token = prob_de.argmax()
+                        de_token = prob_de[:256].argmax()
                     sequence_array_de = np.append(sequence_array_de, de_token)
                     
-                    # Update input
                     sequence_array_de_input = torch.tensor(
                         sequence_array_de[-min(len(sequence_array_de), model.config.n_positions):], 
                         dtype=torch.long, device=device
                     ).unsqueeze(0)
             break
     
-    # Convert back to tensor format
-    sequence_array_de_input = torch.tensor(
-        sequence_array_de, dtype=torch.long, device=device
-    ).unsqueeze(0)
+    # Return channel values (excluding SOS token)
+    return sequence_array_de[1:].astype(np.uint8)
+
+
+def compress_image_lossless_channels(
+    image: Image.Image,
+    model,
+    device: torch.device,
+    parallel: bool = True,
+    vocab_size: int = 512
+) -> Tuple[List[bytes], List[int], List[torch.Tensor], List[np.ndarray], List[torch.Tensor], Tuple[int, int]]:
+    """
+    Compress image by splitting RGB channels and compressing each separately.
+    Lossless compression - preserves all 256 values per channel.
     
-    return sequence_array_de_input
-
-
-def write_padded_bytes(filename: str, data: bytes, num_padded_bits: int, original_length: int):
+    :param image: PIL Image
+    :param model: ImageGPT model
+    :param device: device to run model on
+    :param parallel: whether to compress channels in parallel
+    :param vocab_size: vocabulary size (512 for ImageGPT)
+    :return: (compressed_bytes_list, num_padded_bits_list, start_symbols_list, 
+              sequences_list, probs_list, (height, width))
     """
-    file format:
-    - first byte: number of padded bit
-    - second and third byte: original length (usually, llm context will not exceed 65535)
-    - subsequent bytes: actual bytes data
-
-    :param filename: output file name
-    :param data: bytes data to write
-    :param num_padded_bits: number of padded bits (must be between 0 and 7)
-    :param original_length: original length of the uncompressed data (in tokens)
-    """
-    if not 0 <= num_padded_bits <= 7:
-        raise ValueError("num_padded_bits must be between 0 and 7.")
-
-    if not 0 <= original_length <= 65535:
-        raise ValueError("original_length must be between 0 and 65535.")
-
-    if not isinstance(data, bytes):
-        raise TypeError("data must be of bytes type.")
-
-    with open(filename, 'wb') as f:
-        padding_byte = num_padded_bits.to_bytes(1, 'big')
-        f.write(padding_byte)
-        f.write(original_length.to_bytes(2, 'big'))
-        f.write(data)
-
-
-def read_padded_bytes(filename: str) -> tuple[bytes, int, int]:
-    """
-    Read data and padding bits from a file.
-
-    :param filename: The name of the file to read.
-    :return: A tuple containing (bytes data, number of padded bits, original_length).
-    """
-    with open(filename, 'rb') as f:
-        padding_byte = f.read(1)
-        if not padding_byte:
-            raise EOFError("File is empty or improperly formatted: unable to read padding bits byte.")
-
-        original_length_bytes = f.read(2)
-        if not original_length_bytes:
-            raise EOFError("File is empty or improperly formatted: unable to read original length bytes.")
+    # Convert image to numpy array
+    img_array = np.array(image.convert('RGB'))
+    height, width = img_array.shape[0], img_array.shape[1]
     
-        padding_bits = int.from_bytes(padding_byte, 'big')
-        original_length = int.from_bytes(original_length_bytes, 'big')
-        data = f.read()
-        
-        return data, padding_bits, original_length
-
-
-def tokens_to_image(tokens, clusters, height, width):
-    """
-    Convert token sequence to PIL Image.
+    # Split into R, G, B channels
+    r_channel = img_array[:, :, 0].flatten()
+    g_channel = img_array[:, :, 1].flatten()
+    b_channel = img_array[:, :, 2].flatten()
     
-    :param tokens: token sequence (numpy array, excluding SOS)
-    :param clusters: color clusters from image processor
+    channels = {
+        'R': r_channel,
+        'G': g_channel,
+        'B': b_channel
+    }
+    
+    if parallel:
+        # Compress channels in parallel
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                executor.submit(compress_channel_lossless, ch, model, device, name, vocab_size): name
+                for name, ch in channels.items()
+            }
+            
+            results = {}
+            for future in as_completed(futures):
+                channel_name = futures[future]
+                results[channel_name] = future.result()
+    else:
+        # Compress channels sequentially
+        results = {}
+        for name, ch in channels.items():
+            results[name] = compress_channel_lossless(ch, model, device, name, vocab_size)
+    
+    # Extract results in R, G, B order
+    compressed_bytes_list = [results['R'][0], results['G'][0], results['B'][0]]
+    num_padded_bits_list = [results['R'][1], results['G'][1], results['B'][1]]
+    start_symbols_list = [results['R'][2], results['G'][2], results['B'][2]]
+    sequences_list = [results['R'][3], results['G'][3], results['B'][3]]
+    probs_list = [results['R'][4], results['G'][4], results['B'][4]]
+    
+    return compressed_bytes_list, num_padded_bits_list, start_symbols_list, sequences_list, probs_list, (height, width)
+
+
+def decompress_image_lossless_channels(
+    compressed_bytes_list: List[bytes],
+    num_padded_bits_list: List[int],
+    start_symbols_list: List[torch.Tensor],
+    model,
+    device: torch.device,
+    original_seq_lens: List[int],
+    stored_probs_list: List[torch.Tensor] = None,
+    height: int = None,
+    width: int = None,
+    vocab_size: int = 512,
+    parallel: bool = True
+) -> Image.Image:
+    """
+    Decompress image by decompressing each channel separately.
+    
+    :param compressed_bytes_list: list of compressed data for R, G, B channels
+    :param num_padded_bits_list: list of padded bits for each channel
+    :param start_symbols_list: list of SOS tokens for each channel
+    :param model: ImageGPT model
+    :param device: device to run model on
+    :param original_seq_lens: list of original sequence lengths for each channel
+    :param stored_probs_list: list of stored probability distributions
     :param height: image height
     :param width: image width
+    :param vocab_size: vocabulary size (512 for ImageGPT)
+    :param parallel: whether to decompress channels in parallel
     :return: PIL Image
     """
-    # Ensure we have enough tokens
-    expected_tokens = height * width
-    if len(tokens) < expected_tokens:
-        # Pad with zeros if needed
-        tokens = np.pad(tokens, (0, expected_tokens - len(tokens)), constant_values=0)
-    elif len(tokens) > expected_tokens:
-        # Truncate if too many
-        tokens = tokens[:expected_tokens]
+    if stored_probs_list is None:
+        stored_probs_list = [None, None, None]
     
-    # Reshape to image dimensions
-    token_indices = tokens.reshape(height, width)
+    if parallel:
+        # Decompress channels in parallel
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                executor.submit(
+                    decompress_channel_lossless,
+                    compressed_bytes_list[i],
+                    num_padded_bits_list[i],
+                    model,
+                    start_symbols_list[i],
+                    device,
+                    original_seq_lens[i],
+                    stored_probs_list[i],
+                    vocab_size
+                ): i
+                for i in range(3)
+            }
+            
+            channel_results = {}
+            for future in as_completed(futures):
+                channel_idx = futures[future]
+                channel_results[channel_idx] = future.result()
+            
+            # Reorder to R, G, B
+            r_channel = channel_results[0]
+            g_channel = channel_results[1]
+            b_channel = channel_results[2]
+    else:
+        # Decompress channels sequentially
+        r_channel = decompress_channel_lossless(
+            compressed_bytes_list[0], num_padded_bits_list[0],
+            model, start_symbols_list[0], device, original_seq_lens[0],
+            stored_probs_list[0], vocab_size
+        )
+        g_channel = decompress_channel_lossless(
+            compressed_bytes_list[1], num_padded_bits_list[1],
+            model, start_symbols_list[1], device, original_seq_lens[1],
+            stored_probs_list[1], vocab_size
+        )
+        b_channel = decompress_channel_lossless(
+            compressed_bytes_list[2], num_padded_bits_list[2],
+            model, start_symbols_list[2], device, original_seq_lens[2],
+            stored_probs_list[2], vocab_size
+        )
     
-    # Convert cluster indices to RGB values
-    reconstructed_img_array = np.zeros((height, width, 3), dtype=np.uint8)
-    for i in range(height):
-        for j in range(width):
-            token_idx = int(token_indices[i, j])
-            if 0 <= token_idx < len(clusters):
-                # Convert from [-1, 1] to [0, 255]
-                rgb = np.rint(127.5 * (clusters[token_idx] + 1.0)).astype(np.uint8)
-                reconstructed_img_array[i, j] = rgb
+    # Reconstruct image
+    if height is None or width is None:
+        # Infer from channel length
+        total_pixels = len(r_channel)
+        height = width = int(np.sqrt(total_pixels))
     
-    return Image.fromarray(reconstructed_img_array, mode='RGB')
+    r_channel = r_channel.reshape(height, width)
+    g_channel = g_channel.reshape(height, width)
+    b_channel = b_channel.reshape(height, width)
+    
+    img_array = np.stack([r_channel, g_channel, b_channel], axis=2)
+    return Image.fromarray(img_array, mode='RGB')
+
+
+def write_channel_data(filename: str, compressed_bytes_list: List[bytes], 
+                       num_padded_bits_list: List[int], original_seq_lens: List[int],
+                       height: int, width: int):
+    """
+    Write compressed channel data to file.
+    Format:
+    - 2 bytes: height
+    - 2 bytes: width
+    - For each channel (R, G, B):
+      - 1 byte: num_padded_bits
+      - 2 bytes: original_seq_len
+      - 4 bytes: data_size (size of compressed_data)
+      - compressed_data
+    """
+    with open(filename, 'wb') as f:
+        # Write image dimensions
+        f.write(height.to_bytes(2, 'big'))
+        f.write(width.to_bytes(2, 'big'))
+        
+        # Write each channel
+        for compressed_bytes, num_padded_bits, original_len in zip(
+            compressed_bytes_list, num_padded_bits_list, original_seq_lens
+        ):
+            f.write(num_padded_bits.to_bytes(1, 'big'))
+            f.write(original_len.to_bytes(2, 'big'))
+            f.write(len(compressed_bytes).to_bytes(4, 'big'))  # Size of compressed data
+            f.write(compressed_bytes)
+
+
+def read_channel_data(filename: str) -> Tuple[List[bytes], List[int], List[int], int, int]:
+    """
+    Read compressed channel data from file.
+    Returns: (compressed_bytes_list, num_padded_bits_list, original_seq_lens, height, width)
+    """
+    with open(filename, 'rb') as f:
+        # Read image dimensions
+        height = int.from_bytes(f.read(2), 'big')
+        width = int.from_bytes(f.read(2), 'big')
+        
+        compressed_bytes_list = []
+        num_padded_bits_list = []
+        original_seq_lens = []
+        
+        # Read each channel (R, G, B)
+        for _ in range(3):
+            num_padded_bits = int.from_bytes(f.read(1), 'big')
+            original_len = int.from_bytes(f.read(2), 'big')
+            data_size = int.from_bytes(f.read(4), 'big')  # Size of compressed data
+            compressed_data = f.read(data_size)
+            
+            num_padded_bits_list.append(num_padded_bits)
+            original_seq_lens.append(original_len)
+            compressed_bytes_list.append(compressed_data)
+    
+    return compressed_bytes_list, num_padded_bits_list, original_seq_lens, height, width
 
 
 def main():
-    """Main compression and decompression pipeline."""
+    """Main compression and decompression pipeline (lossless, 24x24)."""
+    parser = argparse.ArgumentParser(
+        description="Image compression using ImageGPT in lossless RGB channel-split mode"
+    )
+    parser.add_argument(
+        "--image",
+        type=str,
+        default="test/pixel.png",
+        help="Path to input image"
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output filename prefix (default: based on input image name)"
+    )
+    parser.add_argument(
+        "--no-parallel",
+        action="store_true",
+        help="Disable parallel processing of channels"
+    )
+    parser.add_argument(
+        "--size",
+        type=int,
+        nargs=2,
+        default=[24, 24],
+        metavar=("HEIGHT", "WIDTH"),
+        help="Size the image will be resized to BEFORE compression (default: 24 24)"
+    )
+
+    args = parser.parse_args()
+    
     # Verify GPU availability
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     print(f"CUDA available: {torch.cuda.is_available()}")
 
-    # Load ImageGPT model and processor
+    # Load ImageGPT model
     print("\nLoading ImageGPT model...")
-    image_processor = AutoImageProcessor.from_pretrained("openai/imagegpt-small")
     model = ImageGPTForCausalImageModeling.from_pretrained("openai/imagegpt-small")
     model.eval()
     model.to(device)
+    vocab_size = model.config.vocab_size
+    print(f"Model vocabulary size: {vocab_size}")
 
     # Load image
-    print("\nLoading sample image...")
-    image_path = "test/pixel.png"
-    if not os.path.exists(image_path):
-        raise FileNotFoundError(f"Image not found: {image_path}")
+    print(f"\nLoading image from {args.image}...")
+    if not os.path.exists(args.image):
+        raise FileNotFoundError(f"Image not found: {args.image}")
     
-    image = Image.open(image_path).convert("RGB")
-    print(f"✓ Successfully loaded image from {image_path}")
+    image = Image.open(args.image).convert("RGB")
+    print(f"✓ Successfully loaded image")
     print(f"  Original size: {image.size} (width x height)")
 
-    # Preprocess image: resize to 24x24
-    target_size = {"height": 24, "width": 24}
-    print(f"\nPreprocessing image to {target_size}...")
-    inputs = image_processor(
-        images=image, 
-        return_tensors="pt",
-        size=target_size
-    )
-    input_ids = inputs["input_ids"].to(device)
-    print(f"Input token shape: {input_ids.shape}")
-    print(f"Sequence length: {input_ids.shape[1]} (including SOS token)")
+    # Resize image BEFORE compression (this is the "true" image for the pipeline)
+    target_height, target_width = args.size
+    print(f"\nResizing image to {target_width}x{target_height} for compression...")
+    image = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+    print(f"  New size for compression: {image.size} (width x height)")
 
-    # Compute original bits: H × W × 3 × 8
-    height, width = target_size["height"], target_size["width"]
+    # Set output filenames (based on resized size)
+    suffix = f"{target_width}x{target_height}"
+    if args.output is None:
+        base_name = os.path.splitext(os.path.basename(args.image))[0]
+        compressed_file = f"{base_name}_{suffix}_compressed.bin"
+        original_resized_file = f"{base_name}_{suffix}_original.png"
+        decompressed_file = f"{base_name}_{suffix}_decompressed.png"
+    else:
+        prefix = f"{args.output}_{suffix}"
+        compressed_file = f"{prefix}_compressed.bin"
+        original_resized_file = f"{prefix}_original.png"
+        decompressed_file = f"{prefix}_decompressed.png"
+
+    # Save the resized "original 24x24" image
+    image.save(original_resized_file)
+    print(f"\n✓ Saved resized original image (for reference) to: {original_resized_file}")
+
+    # LOSSLESS MODE (always)
+    print("\n" + "="*60)
+    print("=== LOSSLESS MODE (Channel-Split) ===")
+    print("="*60)
+    print("Compressing RGB channels separately (no quantization)")
+
+    # Use the resized image size for lossless compression
+    width, height = image.size
     original_bits = height * width * 3 * 8
     print(f"Original bits: {original_bits} (H={height}, W={width}, C=3, bits_per_pixel=8)")
 
-    # Compression workflow
+    # COMPRESSION
     print("\n" + "="*60)
     print("=== COMPRESSION ===")
     print("="*60)
     compression_start_time = time.time()
 
-    metric = Metric()
-    with torch.no_grad():
-        # Get logits for all positions
-        position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=device).unsqueeze(0)
-        model_outputs = model(
-            input_ids=input_ids,
-            use_cache=False,
-            position_ids=position_ids,
-            past_key_values=None
-        )
-        # ImageGPT predicts next token, so we need logits[:-1] to match input_ids[1:]
-        logits = model_outputs.logits[:, :-1].to(torch.float32)
-
-    compressed_bytes, num_padded_bits, start_symbol, sequence_array, pd, probs, compressed_bits = compress_image(
-        input_ids, logits, metric, original_bits
+    parallel = not args.no_parallel
+    (
+        compressed_bytes_list,
+        num_padded_bits_list,
+        start_symbols_list,
+        sequences_list,
+        probs_list,
+        (img_height, img_width),
+    ) = compress_image_lossless_channels(
+        image, model, device, parallel=parallel, vocab_size=vocab_size
     )
 
     compression_end_time = time.time()
     compression_time = compression_end_time - compression_start_time
-    print(f"\nCompression completed in {compression_time:.2f} seconds")
 
-    # Save compressed data
-    original_length = input_ids.shape[1] - 1  # Exclude SOS token
-    bin_filename = "compressed.bin"
-    write_padded_bytes(bin_filename, compressed_bytes, num_padded_bits, original_length)
-    print(f"✓ Saved compressed data to {bin_filename}")
-    print(f"  Compressed file size: {len(compressed_bytes)} bytes ({len(compressed_bytes) / 1024:.2f} KB)")
+    # Calculate total compressed bits
+    total_compressed_bits = 0
+    for i, (comp_bytes, pad_bits) in enumerate(zip(compressed_bytes_list, num_padded_bits_list)):
+        channel_bits = len(comp_bytes) * 8 + pad_bits
+        total_compressed_bits += channel_bits
+        print(f"Channel {['R','G','B'][i]}: {channel_bits:.2f} bits")
 
-    # Test reading back
-    compressed_bytes_read, num_padded_bits_read, original_length_read = read_padded_bytes(bin_filename)
-    print(f"✓ Read back: original_length={original_length_read}, num_padded_bits={num_padded_bits_read}")
+    compression_ratio = total_compressed_bits / original_bits
+    compression_rate = original_bits / total_compressed_bits if total_compressed_bits > 0 else 0
 
-    # Decompression workflow
+    print(f"\nTotal compressed bits: {total_compressed_bits:.2f}")
+    print(f"Compression ratio: {compression_ratio:.6f} ({compression_ratio*100:.2f}% of original)")
+    print(f"Compression rate: {compression_rate:.6f}x")
+    print(f"Compression time: {compression_time:.2f} seconds")
+
+    # Save compressed data for all channels
+    original_seq_lens = [len(seq) for seq in sequences_list]
+    write_channel_data(
+        compressed_file,
+        compressed_bytes_list,
+        num_padded_bits_list,
+        original_seq_lens,
+        img_height,
+        img_width
+    )
+    print(f"\n✓ Saved compressed data to {compressed_file}")
+    total_compressed_size = sum(len(b) for b in compressed_bytes_list)
+    print(f"  Total compressed raw size (all channels): {total_compressed_size} bytes ({total_compressed_size / 1024:.2f} KB)")
+
+    # DECOMPRESSION
     print("\n" + "="*60)
     print("=== DECOMPRESSION ===")
     print("="*60)
     decompression_start_time = time.time()
 
-    decompressed = decode_image(
+    compressed_bytes_read, num_padded_bits_read, original_seq_lens_read, height_read, width_read = read_channel_data(compressed_file)
+
+    reconstructed_image = decompress_image_lossless_channels(
         compressed_bytes_read,
         num_padded_bits_read,
+        start_symbols_list,
         model,
-        start_symbol,
         device,
-        original_length_read,
-        sequence_array,
-        pd,
-        probs,
-        do_test=False,  # Disable test output for cleaner logs
+        original_seq_lens_read,
+        stored_probs_list=probs_list,
+        height=height_read,
+        width=width_read,
+        vocab_size=vocab_size,
+        parallel=parallel
     )
 
     decompression_end_time = time.time()
     decompression_time = decompression_end_time - decompression_start_time
     print(f"✓ Decompression completed in {decompression_time:.2f} seconds")
 
-    # Verify reconstruction
+    # VERIFICATION (both 24x24)
+    original_array = np.array(image)
+    reconstructed_array = np.array(reconstructed_image)
+
     print("\n" + "="*60)
-    print("=== VERIFICATION ===")
+    print("=== VERIFICATION (24x24) ===")
     print("="*60)
-    decompressed_tokens = decompressed.squeeze(0).cpu().numpy()
-    original_tokens = input_ids.squeeze(0).cpu().numpy()
-    
-    print(f"Original tokens shape: {original_tokens.shape}")
-    print(f"Decoded tokens shape: {decompressed_tokens.shape}")
-    
-    # Compare (only compare the non-SOS tokens)
-    if len(decompressed_tokens) == len(original_tokens):
-        matches = np.array_equal(original_tokens, decompressed_tokens)
-        print(f"Tokens match exactly: {matches}")
+    if original_array.shape == reconstructed_array.shape:
+        matches = np.array_equal(original_array, reconstructed_array)
+        print(f"Images match exactly: {matches}")
         if not matches:
-            mismatch_count = np.sum(original_tokens != decompressed_tokens)
-            accuracy = (1 - mismatch_count/len(original_tokens)) * 100
-            print(f"  Mismatched tokens: {mismatch_count}/{len(original_tokens)}")
+            mismatch_count = np.sum(original_array != reconstructed_array)
+            total_pixels = original_array.size
+            accuracy = (1 - mismatch_count/total_pixels) * 100
+            print(f"  Mismatched pixels: {mismatch_count}/{total_pixels}")
             print(f"  Accuracy: {accuracy:.2f}%")
     else:
-        min_len = min(len(original_tokens), len(decompressed_tokens))
-        matches = np.array_equal(original_tokens[:min_len], decompressed_tokens[:min_len])
-        print(f"Token length mismatch: {len(original_tokens)} vs {len(decompressed_tokens)}")
-        print(f"First {min_len} tokens match: {matches}")
+        print(f"Image shape mismatch: {original_array.shape} vs {reconstructed_array.shape}")
 
-    # Final metrics
-    compress_rate, compress_ratio = metric.compute_ratio()
+    # Save decompressed 24x24 image
+    reconstructed_image.save(decompressed_file)
+    print(f"\n✓ Saved decompressed 24x24 image to: {decompressed_file}")
+
     print("\n" + "="*60)
-    print("=== FINAL METRICS ===")
+    print("✓ SUCCESS! Lossless 24x24 pipeline completed.")
     print("="*60)
-    print(f"Original bits: {metric.total_bits:.2f}")
-    print(f"Compressed bits: {metric.compressed_bits:.2f}")
-    print(f"Compression ratio: {compress_ratio:.6f} ({compress_ratio*100:.2f}% of original)")
-    print(f"Compression rate: {compress_rate:.6f}x")
-    print(f"Compression time: {compression_time:.2f} seconds")
-    print(f"Decompression time: {decompression_time:.2f} seconds")
-
-    # Reconstruct and save image
-    print("\n" + "="*60)
-    print("=== IMAGE RECONSTRUCTION ===")
-    print("="*60)
-    clusters = image_processor.clusters
-    
-    # Get decompressed tokens (excluding SOS token)
-    decompressed_tokens_no_sos = decompressed_tokens[1:] if len(decompressed_tokens) > 1 else decompressed_tokens
-    print(f"Decompressed tokens (excluding SOS): {len(decompressed_tokens_no_sos)}")
-    print(f"Expected image size: {height}×{width} = {height * width} pixels")
-
-    # Convert tokens back to image
-    reconstructed_image = tokens_to_image(decompressed_tokens_no_sos, clusters, height, width)
-    
-    # Save the decompressed image
-    output_image = "compressed-pixel.png"
-    reconstructed_image.save(output_image)
-    print(f"✓ Saved decompressed image to: {output_image}")
-    
-    file_size = os.path.getsize(output_image) / 1024
-    print(f"  File size: {file_size:.2f} KB")
-    
-    # Display comparison
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-    
-    # Original (quantized)
-    original_tokens_no_sos = original_tokens[1:]
-    original_processed = tokens_to_image(original_tokens_no_sos, clusters, height, width)
-    axes[0].imshow(original_processed)
-    axes[0].set_title('Original (Quantized)\n24×24 pixels', fontsize=12, fontweight='bold')
-    axes[0].axis('off')
-    
-    # Reconstructed
-    axes[1].imshow(reconstructed_image)
-    axes[1].set_title(f'Decompressed\nCompression ratio: {compress_ratio:.3f}', 
-                     fontsize=12, fontweight='bold', color='green')
-    axes[1].axis('off')
-    
-    plt.tight_layout()
-    comparison_filename = "compression_comparison.png"
-    plt.savefig(comparison_filename, dpi=300, bbox_inches='tight')
-    print(f"✓ Saved comparison figure to: {comparison_filename}")
-    
-    print("\n" + "="*60)
-    print("✓ SUCCESS! Pipeline completed.")
-    print("="*60)
-    print(f"  - Compressed file: {bin_filename}")
-    print(f"  - Decompressed image: {output_image}")
-    print(f"  - Comparison figure: {comparison_filename}")
-
+    print(f"  - Compressed file: {compressed_file}")
+    print(f"  - Original 24x24 image: {original_resized_file}")
+    print(f"  - Decompressed 24x24 image: {decompressed_file}")
 
 if __name__ == "__main__":
     main()
