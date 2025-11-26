@@ -41,7 +41,7 @@ class CompressionConfig:
     # Dataset paths (relative to project root)
     DATASET_IMAGE = "datasets/clic_2024/bmp/*.bmp"
     DATASET_AUDIO = "datasets/librispeech/wav/*.wav"
-    TEST_DATASET_IMAGE = "../datasets/medical/bmp/*.bmp"  # Relative to imageGPT directory
+    TEST_DATASET_IMAGE = "../datasets/simple/bmp/*.bmp"  # Relative to imageGPT directory
     TEST_DATASET_AUDIO = "datasets/test_workflow/wav/*.wav"
     
     # Output paths
@@ -532,6 +532,7 @@ def load_bgpt_model(checkpoint_path, device):
 
     logger.info("✓ bGPT model loaded successfully!")
     logger.info("=" * 80)
+    
     return llm
 
 
@@ -1160,7 +1161,7 @@ if __name__ == "__main__":
     # Option 2: Run BMP compression test
     logger.info("")
     logger.info("=" * 80)
-    logger.info("Running BMP Compression Test (Medical Dataset)")
+    logger.info("Running BMP Compression Test (Simple Dataset)")
     logger.info("=" * 80)
     test_bmp_compression(
         model=llm,
