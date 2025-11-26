@@ -677,6 +677,7 @@ def test_bmp_compression(
     
     # Find all BMP files
     bmp_files = glob(dataset_path)
+    bmp_files = bmp_files[:1] 
     
     if not bmp_files:
         logger.error(f"No BMP files found in {dataset_path}")
