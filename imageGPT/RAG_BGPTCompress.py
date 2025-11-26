@@ -1,9 +1,14 @@
+import os
+
+# Allow FAISS + PyTorch (both linked against OpenMP) to coexist on macOS
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 import gc
 import torch
 import numpy as np
 import faiss
 import pickle
-import os
 from typing import List, Dict, Any, Optional, Tuple
 from glob import glob
 from tqdm import tqdm
@@ -26,8 +31,8 @@ logger = logging.getLogger(__name__)
 class RAGBGPTConfig:
     """Configuration for RAG-enhanced bGPT compression"""
     # Dataset paths for RAG indexing
-    RAG_DATASET_PATH = "datasets/clic-2024/bmp/*.bmp"  # Images to index for RAG
-    TEST_COMPRESSION_DATASET = "datasets/simple/bmp/*.bmp"  # Images to compress
+    RAG_DATASET_PATH = "../datasets/simple/bmp/pixel_tiny.bmp"  # Images to index for RAG (using same tiny image for fast testing)
+    TEST_COMPRESSION_DATASET = "../datasets/simple/bmp/pixel_tiny.bmp"  # Images to compress - using tiny 32x32 image for fast testing
     
     # Storage paths
     RETRIEVER_STORAGE_PATH = "retriever_cache/image-patches-storage"
@@ -36,8 +41,8 @@ class RAGBGPTConfig:
     MODEL_CHECKPOINT_IMAGE = "./pretrained/bgpt/weights-image.pth"
     
     # Retrieval parameters
-    NUM_PATCHES_TO_INDEX = 10000  # Number of patches to index from RAG dataset
-    TOP_K_RETRIEVAL = 3  # Number of similar patches to retrieve as context
+    NUM_PATCHES_TO_INDEX = 50  # Number of patches to index from RAG dataset (reduced for fast testing)
+    TOP_K_RETRIEVAL = 2  # Number of similar patches to retrieve as context (reduced for speed)
     PATCH_SIZE = 32  # Size of square patches (should match CompressionConfig.BMP_PATCH_SIZE)
     
     # Compression parameters
@@ -323,7 +328,16 @@ def setup_image_retriever(
         logger.info("Index is empty. Building new index...")
         logger.info(f"Loading images from: {rag_dataset_path}")
         
-        image_paths = glob(rag_dataset_path)
+        # Handle both glob patterns and specific files
+        if '*' in rag_dataset_path or '?' in rag_dataset_path:
+            image_paths = glob(rag_dataset_path)
+        else:
+            # Single file path
+            if os.path.exists(rag_dataset_path):
+                image_paths = [rag_dataset_path]
+            else:
+                image_paths = []
+        
         if not image_paths:
             logger.warning(f"No images found at {rag_dataset_path}")
             logger.info("Retriever initialized but not indexed. You can index later.")
@@ -372,36 +386,21 @@ def compress_patch_with_rag_context(
         for i, result in enumerate(similar_patches, 1):
             logger.info(f"Result {i}: Score={result['score']:.4f}, Patch size={len(result['patch_bytes'])} bytes")
     
-    # Prepare context patches (concatenate retrieved patches)
-    context_patches = []
+    # Prepare context bytes (concatenate retrieved patches)
+    context_bytes = []
     if similar_patches:
         for result in similar_patches:
-            context_patches.extend(result['patch_bytes'])
+            context_bytes.extend(result['patch_bytes'])
     
-    # Prepare input: context + target patch
-    if context_patches:
-        # Pad context patches for bGPT
-        context_padded = pad_input_for_bgpt([context_patches], [ext], device)
-        context_input_ids = context_padded["patches"]
-        context_length = context_input_ids.shape[1]
-    else:
-        context_input_ids = None
-        context_length = 0
+    # Combine context and target bytes into a single sequence and pad once
+    combined_bytes = context_bytes + patch_bytes
+    combined_padded = pad_input_for_bgpt([combined_bytes], [ext], device)
+    full_input_ids = combined_padded["patches"]
+    full_masks = combined_padded["masks"]
     
-    # Prepare target patch
-    target_padded = pad_input_for_bgpt([patch_bytes], [ext], device)
-    target_input_ids = target_padded["patches"]
-    target_masks = target_padded["masks"]
-    
-    # Concatenate context and target
-    if context_input_ids is not None:
-        full_input_ids = torch.cat([context_input_ids, target_input_ids], dim=1)
-        # Extend masks for context
-        context_masks = torch.ones((1, context_length), dtype=torch.long, device=device)
-        full_masks = torch.cat([context_masks, target_masks], dim=1)
-    else:
-        full_input_ids = target_input_ids
-        full_masks = target_masks
+    # Track actual byte lengths for slicing logits later
+    context_length = len(context_bytes)
+    target_length = len(patch_bytes)
     
     # Generate logits
     with torch.inference_mode():
@@ -414,18 +413,19 @@ def compress_patch_with_rag_context(
         
         # Extract only the target patch portion (after context)
         start_patch = full_input_ids[:, :CompressionConfig.PATCH_SIZE].squeeze(0)
-        target_start_idx = CompressionConfig.PATCH_SIZE + context_length
-        target_end_idx = full_input_ids.shape[1] - CompressionConfig.PATCH_SIZE
-        target_input_ids = full_input_ids[:, target_start_idx:target_end_idx]
         
-        # Add start token
-        target_input_ids = torch.cat(
-            [torch.tensor([[256]], device=device), target_input_ids], dim=1
+        # Build compression input for target bytes only
+        target_sequence = [256] + patch_bytes  # prepend start token
+        target_input_ids = torch.tensor(
+            [target_sequence],
+            dtype=torch.long,
+            device=device,
         )
         
-        # Extract corresponding logits for target patch
+        # Extract logits corresponding only to the target portion
         target_logits_start = context_length
-        target_logits = logits[:, target_logits_start:, :]
+        target_logits_end = target_logits_start + target_length
+        target_logits = logits[:, target_logits_start:target_logits_end, :]
     
     # Compress using the target portion
     compression_results = bgpt_compress(
@@ -443,7 +443,8 @@ def run_rag_bgpt_compression(
     test: bool = True,
     temp_folder: str = "temp_img_rag",
     output_folder: str = "output_img_rag",
-    patch_size: int = None
+    patch_size: int = None,
+    skip_decompression: bool = False
 ):
     """
     Main workflow for RAG-enhanced bGPT image compression
@@ -471,8 +472,16 @@ def run_rag_bgpt_compression(
     else:
         dataset_path = RAGBGPTConfig.RAG_DATASET_PATH
     
-    # Find images to compress
-    image_paths = glob(dataset_path)
+    # Find images to compress (handle both glob patterns and specific files)
+    if '*' in dataset_path or '?' in dataset_path:
+        image_paths = glob(dataset_path)
+    else:
+        # Single file path
+        if os.path.exists(dataset_path):
+            image_paths = [dataset_path]
+        else:
+            image_paths = []
+    
     if not image_paths:
         logger.error(f"No images found at {dataset_path}")
         return
@@ -563,34 +572,40 @@ def run_rag_bgpt_compression(
         logger.info(f"\nCompression completed")
         logger.info(f"  Overall compression ratio: {compress_ratio:.6f}")
         logger.info(f"  Overall compression rate: {compress_rate:.6f}x")
+        logger.info(f"  Total compressed: {total_metric.compressed_length:,} bytes")
+        logger.info(f"  Total original: {total_metric.total_length:,} bytes")
         
-        # Decompress patches (simplified - would need RAG context during decompression too)
-        logger.info(f"Decompressing patches...")
-        decompressed_subfolder = os.path.join(decompressed_folder, name_without_ext)
-        os.makedirs(decompressed_subfolder, exist_ok=True)
-        
-        for patch_id, info in tqdm(compressed_info.items(), desc="Decompressing patches"):
-            # Read compressed data
-            compressed_bytes, num_padded_bits, original_length = read_padded_bytes(
-                info['compressed_path']
-            )
+        # Decompress patches (skip if requested)
+        if skip_decompression:
+            logger.info("")
+            logger.info("Skipping decompression (skip_decompression=True)")
+        else:
+            logger.info(f"Decompressing patches...")
+            decompressed_subfolder = os.path.join(decompressed_folder, name_without_ext)
+            os.makedirs(decompressed_subfolder, exist_ok=True)
             
-            # Decompress (Note: This is simplified - full RAG decompression would need context)
-            decompressed_tensor = bgpt_decode(
-                compressed_bytes,
-                num_padded_bits,
-                model,
-                info['start_patch'],
-                info['ext'],
-                device,
-                original_length,
-                do_test=False,
-            )
-            
-            # Save decompressed patch
-            decompressed_bytes = decompressed_tensor.squeeze(0).cpu().numpy().tolist()
-            decompressed_path = os.path.join(decompressed_subfolder, f"{patch_id}.bmp")
-            write_bytes(decompressed_path, decompressed_bytes)
+            for patch_id, info in tqdm(compressed_info.items(), desc="Decompressing patches"):
+                # Read compressed data
+                compressed_bytes, num_padded_bits, original_length = read_padded_bytes(
+                    info['compressed_path']
+                )
+                
+                # Decompress (Note: This is simplified - full RAG decompression would need context)
+                decompressed_tensor = bgpt_decode(
+                    compressed_bytes,
+                    num_padded_bits,
+                    model,
+                    info['start_patch'],
+                    info['ext'],
+                    device,
+                    original_length,
+                    do_test=False,
+                )
+                
+                # Save decompressed patch
+                decompressed_bytes = decompressed_tensor.squeeze(0).cpu().numpy().tolist()
+                decompressed_path = os.path.join(decompressed_subfolder, f"{patch_id}.bmp")
+                write_bytes(decompressed_path, decompressed_bytes)
         
         logger.info("=" * 80)
     
@@ -598,8 +613,10 @@ def run_rag_bgpt_compression(
     logger.info("RAG BGPT COMPRESSION COMPLETED!")
     logger.info("=" * 80)
     final_rate, final_ratio = total_metric.compute_ratio()
-    logger.info(f"Final compression ratio: {final_ratio:.6f}")
+    logger.info(f"Final compression ratio: {final_ratio:.6f} ({final_ratio*100:.2f}% of original)")
     logger.info(f"Final compression rate: {final_rate:.6f}x")
+    logger.info(f"Total compressed size: {total_metric.compressed_length:,} bytes ({total_metric.compressed_length/1024:.2f} KB)")
+    logger.info(f"Total original size: {total_metric.total_length:,} bytes ({total_metric.total_length/1024:.2f} KB)")
 
 
 # ==================== Main ====================

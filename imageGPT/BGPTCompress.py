@@ -41,7 +41,7 @@ class CompressionConfig:
     # Dataset paths (relative to project root)
     DATASET_IMAGE = "datasets/clic_2024/bmp/*.bmp"
     DATASET_AUDIO = "datasets/librispeech/wav/*.wav"
-    TEST_DATASET_IMAGE = "../datasets/simple/bmp/*.bmp"  # Relative to imageGPT directory
+    TEST_DATASET_IMAGE = "../datasets/simple/bmp/pixel_tiny.bmp"  # Relative to imageGPT directory - using tiny 32x32 image for fast testing
     TEST_DATASET_AUDIO = "datasets/test_workflow/wav/*.wav"
     
     # Output paths
@@ -652,6 +652,7 @@ def test_bmp_compression(
     temp_folder: str = "temp",
     output_folder: str = "output",
     patch_size: int = None,
+    skip_decompression: bool = False,
 ):
     """
     Test BMP file compression and decompression workflow.
@@ -814,95 +815,108 @@ def test_bmp_compression(
         logger.info(f"  Total compressed: {total_metric.compressed_length:,} bytes")
         logger.info(f"  Total original: {total_metric.total_length:,} bytes")
         
-        # Step 3: Decompress each patch
-        logger.info("")
-        logger.info("-" * 80)
-        logger.info(f"Step 3: Decompressing {len(patch_files)} patches...")
-        decompression_start = time.time()
-        
-        decompressed_subfolder = os.path.join(decompressed_folder, name_without_ext)
-        os.makedirs(decompressed_subfolder, exist_ok=True)
-        logger.debug(f"Decompressed patches will be saved to: {decompressed_subfolder}")
-        
-        for patch_idx, (patch_id, info) in enumerate(tqdm(compressed_info.items(), desc="Decompressing patches", unit="patch"), 1):
-            logger.debug(f"  Decompressing patch {patch_idx}/{len(compressed_info)}: {patch_id}")
-            
-            # Read compressed data
-            read_start = time.time()
-            compressed_bytes, num_padded_bits, original_length = read_padded_bytes(
-                info['compressed_path']
-            )
-            read_time = time.time() - read_start
-            logger.debug(f"    Read compressed data ({len(compressed_bytes)} bytes) in {read_time:.3f}s")
-            
-            # Decompress
-            decode_start = time.time()
-            decompressed_tensor = bgpt_decode(
-                compressed_bytes,
-                num_padded_bits,
-                model,
-                info['start_patch'],
-                info['ext'],
-                device,
-                original_length,
-                do_test=False,
-            )
-            decode_time = time.time() - decode_start
-            logger.debug(f"    Decoding completed in {decode_time:.3f}s")
-            
-            # Convert tensor to bytes and save
-            decompressed_bytes = decompressed_tensor.squeeze(0).cpu().numpy().tolist()
-            decompressed_path = os.path.join(decompressed_subfolder, f"{patch_id}.bmp")
-            write_bytes(decompressed_path, decompressed_bytes)
-            logger.debug(f"    Saved decompressed patch to {decompressed_path}")
-        
-        decompression_total_time = time.time() - decompression_start
-        logger.info(f"✓ Decompression completed in {decompression_total_time:.2f} seconds")
-        
-        # Step 4: Merge patches back to original image
-        logger.info("")
-        logger.info("-" * 80)
-        logger.info("Step 4: Merging patches back to original image...")
-        merge_start = time.time()
-        reconstructed_path = os.path.join(output_folder, f"reconstructed_{filename}")
-        merge_patches_to_bmp(
-            patches_folder=decompressed_subfolder,
-            output_path=reconstructed_path,
-            patch_size=patch_size
-        )
-        merge_time = time.time() - merge_start
-        logger.info(f"✓ Merged image saved to {reconstructed_path} in {merge_time:.2f} seconds")
-        
-        # Step 5: Verify reconstruction
-        logger.info("")
-        logger.info("-" * 80)
-        logger.info("Step 5: Verifying reconstruction...")
-        verify_start = time.time()
-        original_bytes, _ = read_bytes(bmp_file)
-        reconstructed_bytes, _ = read_bytes(reconstructed_path)
-        
-        # Remove padding from both
-        while original_bytes and original_bytes[-1] == 256:
-            original_bytes = original_bytes[:-1]
-        while reconstructed_bytes and reconstructed_bytes[-1] == 256:
-            reconstructed_bytes = reconstructed_bytes[:-1]
-        
-        verify_time = time.time() - verify_start
-        
-        if original_bytes == reconstructed_bytes:
-            logger.info(f"✓ Reconstruction successful! Files match perfectly.")
-            logger.info(f"  File size: {len(original_bytes):,} bytes")
+        # Step 3: Decompress each patch (skip if requested)
+        if skip_decompression:
+            logger.info("")
+            logger.info("-" * 80)
+            logger.info("Step 3: Skipping decompression (skip_decompression=True)")
+            logger.info("-" * 80)
         else:
-            logger.warning(f"✗ Warning: Reconstructed file differs from original")
-            logger.warning(f"  Original size: {len(original_bytes):,} bytes")
-            logger.warning(f"  Reconstructed size: {len(reconstructed_bytes):,} bytes")
+            logger.info("")
+            logger.info("-" * 80)
+            logger.info(f"Step 3: Decompressing {len(patch_files)} patches...")
+            decompression_start = time.time()
             
-            # Find first difference
-            min_len = min(len(original_bytes), len(reconstructed_bytes))
-            for i in range(min_len):
-                if original_bytes[i] != reconstructed_bytes[i]:
-                    logger.warning(f"  First difference at byte {i}: {original_bytes[i]} vs {reconstructed_bytes[i]}")
-                    break
+            decompressed_subfolder = os.path.join(decompressed_folder, name_without_ext)
+            os.makedirs(decompressed_subfolder, exist_ok=True)
+            logger.debug(f"Decompressed patches will be saved to: {decompressed_subfolder}")
+            
+            for patch_idx, (patch_id, info) in enumerate(tqdm(compressed_info.items(), desc="Decompressing patches", unit="patch"), 1):
+                logger.debug(f"  Decompressing patch {patch_idx}/{len(compressed_info)}: {patch_id}")
+                
+                # Read compressed data
+                read_start = time.time()
+                compressed_bytes, num_padded_bits, original_length = read_padded_bytes(
+                    info['compressed_path']
+                )
+                read_time = time.time() - read_start
+                logger.debug(f"    Read compressed data ({len(compressed_bytes)} bytes) in {read_time:.3f}s")
+                
+                # Decompress
+                decode_start = time.time()
+                decompressed_tensor = bgpt_decode(
+                    compressed_bytes,
+                    num_padded_bits,
+                    model,
+                    info['start_patch'],
+                    info['ext'],
+                    device,
+                    original_length,
+                    do_test=False,
+                )
+                decode_time = time.time() - decode_start
+                logger.debug(f"    Decoding completed in {decode_time:.3f}s")
+                
+                # Convert tensor to bytes and save
+                decompressed_bytes = decompressed_tensor.squeeze(0).cpu().numpy().tolist()
+                decompressed_path = os.path.join(decompressed_subfolder, f"{patch_id}.bmp")
+                write_bytes(decompressed_path, decompressed_bytes)
+                logger.debug(f"    Saved decompressed patch to {decompressed_path}")
+            
+            decompression_total_time = time.time() - decompression_start
+            logger.info(f"✓ Decompression completed in {decompression_total_time:.2f} seconds")
+        
+        # Step 4: Merge patches back to original image (skip if decompression was skipped)
+        if skip_decompression:
+            logger.info("")
+            logger.info("-" * 80)
+            logger.info("Step 4: Skipping merge (decompression was skipped)")
+            logger.info("-" * 80)
+        else:
+            # Step 4: Merge patches back to original image
+            logger.info("")
+            logger.info("-" * 80)
+            logger.info("Step 4: Merging patches back to original image...")
+            merge_start = time.time()
+            reconstructed_path = os.path.join(output_folder, f"reconstructed_{filename}")
+            merge_patches_to_bmp(
+                patches_folder=decompressed_subfolder,
+                output_path=reconstructed_path,
+                patch_size=patch_size
+            )
+            merge_time = time.time() - merge_start
+            logger.info(f"✓ Merged image saved to {reconstructed_path} in {merge_time:.2f} seconds")
+            
+            # Step 5: Verify reconstruction
+            logger.info("")
+            logger.info("-" * 80)
+            logger.info("Step 5: Verifying reconstruction...")
+            verify_start = time.time()
+            original_bytes, _ = read_bytes(bmp_file)
+            reconstructed_bytes, _ = read_bytes(reconstructed_path)
+            
+            # Remove padding from both
+            while original_bytes and original_bytes[-1] == 256:
+                original_bytes = original_bytes[:-1]
+            while reconstructed_bytes and reconstructed_bytes[-1] == 256:
+                reconstructed_bytes = reconstructed_bytes[:-1]
+            
+            verify_time = time.time() - verify_start
+            
+            if original_bytes == reconstructed_bytes:
+                logger.info(f"✓ Reconstruction successful! Files match perfectly.")
+                logger.info(f"  File size: {len(original_bytes):,} bytes")
+            else:
+                logger.warning(f"✗ Warning: Reconstructed file differs from original")
+                logger.warning(f"  Original size: {len(original_bytes):,} bytes")
+                logger.warning(f"  Reconstructed size: {len(reconstructed_bytes):,} bytes")
+                
+                # Find first difference
+                min_len = min(len(original_bytes), len(reconstructed_bytes))
+                for i in range(min_len):
+                    if original_bytes[i] != reconstructed_bytes[i]:
+                        logger.warning(f"  First difference at byte {i}: {original_bytes[i]} vs {reconstructed_bytes[i]}")
+                        break
         
         file_total_time = time.time() - file_start_time
         logger.info("")

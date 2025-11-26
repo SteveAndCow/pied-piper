@@ -1,11 +1,20 @@
 """
 Comparison script for standard BGPT vs RAG-enhanced BGPT compression
 """
-import sys
 import os
+
+# Allow FAISS + PyTorch (both linked against OpenMP) to coexist on macOS
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+import sys
 import logging
-import torch
+import shutil
+from glob import glob
 from pathlib import Path
+
+import torch
+from PIL import Image
 
 # Add paths - ensure we import from the correct locations
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -57,15 +66,23 @@ def run_standard_compression():
     model_checkpoint = CompressionConfig.get_model_checkpoint()
     model = load_bgpt_model(model_checkpoint, device)
     
-    # Run compression
+    # Run compression (skip decompression for speed)
     test_bmp_compression(
         model=model,
         device=device,
         test=True,
         temp_folder="temp_img_standard",
         output_folder="output_img_standard",
-        patch_size=CompressionConfig.BMP_PATCH_SIZE
+        patch_size=CompressionConfig.BMP_PATCH_SIZE,
+        skip_decompression=True  # Skip decompression to save time
     )
+    
+    # Archive standard log before RAG run overwrites it
+    try:
+        shutil.copyfile("compression.log", "compression_standard.log")
+        logger.info("Saved standard compression log to compression_standard.log")
+    except FileNotFoundError:
+        logger.warning("compression.log not found after standard run; cannot archive log.")
     
     print("=" * 80)
     print("STANDARD COMPRESSION COMPLETED")
@@ -80,17 +97,105 @@ def run_rag_compression():
     print("TEST 2: RAG-ENHANCED BGPT COMPRESSION")
     print("=" * 80)
     
-    # Run RAG compression (it will handle model loading internally)
+    # Run RAG compression (it will handle model loading internally, skip decompression for speed)
     run_rag_bgpt_compression(
         test=True,
         temp_folder="temp_img_rag",
         output_folder="output_img_rag",
-        patch_size=RAGBGPTConfig.PATCH_SIZE
+        patch_size=RAGBGPTConfig.PATCH_SIZE,
+        skip_decompression=True  # Skip decompression to save time
     )
+    
+    # Archive the log produced during RAG run (BGPT logger reuses compression.log)
+    try:
+        shutil.copyfile("compression.log", "compression_rag.log")
+        logger.info("Saved RAG compression log to compression_rag.log")
+    except FileNotFoundError:
+        logger.warning("compression.log not found after RAG run; cannot archive log.")
     
     print("=" * 80)
     print("RAG COMPRESSION COMPLETED")
     print("=" * 80)
+
+
+def write_builtin_log(log_path, label, metrics):
+    with open(log_path, "w") as log_file:
+        log_file.write(f"{label} compression results\n")
+        log_file.write(f"Final compression ratio: {metrics['ratio']:.6f}\n")
+        log_file.write(f"Final compression rate: {metrics['rate']:.6f}\n")
+        log_file.write(f"Total compressed size: {metrics['compressed_size']:,} bytes\n")
+        log_file.write(f"Total original size: {metrics['original_size']:,} bytes\n")
+
+
+def run_builtin_image_compression(format_name: str, save_kwargs: dict | None = None):
+    """Compress BMP dataset into another image format (JPEG/PNG) and report metrics."""
+    format_upper = format_name.upper()
+    format_lower = format_name.lower()
+    save_kwargs = save_kwargs or {}
+    
+    dataset_path = CompressionConfig.get_dataset_path(test=True)
+    image_paths = glob(dataset_path)
+    if not image_paths:
+        logger.warning(f"No BMP files found for builtin {format_upper} compression in {dataset_path}")
+        return None
+    
+    output_folder = os.path.join("output_img_builtin", format_lower)
+    os.makedirs(output_folder, exist_ok=True)
+    
+    total_original = 0
+    total_compressed = 0
+    
+    print("\n" + "=" * 80)
+    print(f"TEST {format_upper}: BUILTIN {format_upper} COMPRESSION")
+    print("=" * 80)
+    
+    for image_path in image_paths:
+        original_size = os.path.getsize(image_path)
+        total_original += original_size
+        
+        filename = os.path.splitext(os.path.basename(image_path))[0]
+        output_path = os.path.join(output_folder, f"{filename}.{format_lower}")
+        
+        with Image.open(image_path) as img:
+            # Convert to appropriate mode for each format
+            if format_upper == "PNG":
+                img = img.convert("RGBA")
+            else:
+                img = img.convert("RGB")
+            img.save(output_path, format=format_upper, **save_kwargs)
+        
+        compressed_size = os.path.getsize(output_path)
+        total_compressed += compressed_size
+        
+        logger.info(
+            f"{format_upper} | {filename} | original: {original_size} bytes | "
+            f"compressed: {compressed_size} bytes"
+        )
+    
+    if total_original == 0 or total_compressed == 0:
+        logger.warning(f"{format_upper} compression produced zero-length metrics.")
+        return None
+    
+    ratio = total_compressed / total_original
+    rate = total_original / total_compressed
+    metrics = {
+        "ratio": ratio,
+        "rate": rate,
+        "compressed_size": total_compressed,
+        "original_size": total_original,
+    }
+    
+    print(f"\n{format_upper} compression finished")
+    print(f"  Overall compression ratio: {ratio:.6f}")
+    print(f"  Overall compression rate: {rate:.6f}x")
+    print(f"  Total original size: {total_original:,} bytes")
+    print(f"  Total compressed size: {total_compressed:,} bytes")
+    
+    log_path = f"compression_{format_lower}.log"
+    write_builtin_log(log_path, f"{format_upper}", metrics)
+    logger.info(f"Saved {format_upper} compression log to {log_path}")
+    
+    return metrics
 
 
 def extract_compression_metrics_from_log(log_file):
@@ -103,33 +208,45 @@ def extract_compression_metrics_from_log(log_file):
         with open(log_file, 'r') as f:
             lines = f.readlines()
             for line in lines:
-                # Extract compression ratio
-                if "Final compression ratio:" in line or "compression ratio:" in line:
-                    # Look for pattern like "ratio: 0.123456"
-                    import re
-                    match = re.search(r'ratio:\s*([\d.]+)', line)
+                import re
+                # Extract compression ratio (look for "Final compression ratio: 0.123456")
+                if "Final compression ratio:" in line:
+                    match = re.search(r'Final compression ratio:\s*([\d.]+)', line)
                     if match:
                         metrics['ratio'] = float(match.group(1))
+                elif "compression ratio:" in line and "Final" not in line:
+                    match = re.search(r'compression ratio:\s*([\d.]+)', line)
+                    if match and 'ratio' not in metrics:
+                        metrics['ratio'] = float(match.group(1))
                 
-                # Extract compression rate
-                if "Final compression rate:" in line or "compression rate:" in line:
-                    import re
-                    match = re.search(r'rate:\s*([\d.]+)', line)
+                # Extract compression rate (look for "Final compression rate: 2.123456")
+                if "Final compression rate:" in line:
+                    match = re.search(r'Final compression rate:\s*([\d.]+)', line)
                     if match:
                         metrics['rate'] = float(match.group(1))
+                elif "compression rate:" in line and "Final" not in line:
+                    match = re.search(r'compression rate:\s*([\d.]+)', line)
+                    if match and 'rate' not in metrics:
+                        metrics['rate'] = float(match.group(1))
                 
-                # Extract compressed size
-                if "Total compressed size:" in line or "compressed size:" in line:
-                    import re
-                    match = re.search(r'size:\s*([\d,]+)', line)
+                # Extract compressed size (look for "Total compressed size: 1,234 bytes")
+                if "Total compressed size:" in line:
+                    match = re.search(r'Total compressed size:\s*([\d,]+)', line)
                     if match:
                         metrics['compressed_size'] = int(match.group(1).replace(',', ''))
+                elif "compressed size:" in line and "Total" not in line:
+                    match = re.search(r'compressed size:\s*([\d,]+)', line)
+                    if match and 'compressed_size' not in metrics:
+                        metrics['compressed_size'] = int(match.group(1).replace(',', ''))
                 
-                # Extract original size
-                if "Total original size:" in line or "original size:" in line:
-                    import re
-                    match = re.search(r'size:\s*([\d,]+)', line)
+                # Extract original size (look for "Total original size: 1,234 bytes")
+                if "Total original size:" in line:
+                    match = re.search(r'Total original size:\s*([\d,]+)', line)
                     if match:
+                        metrics['original_size'] = int(match.group(1).replace(',', ''))
+                elif "original size:" in line and "Total" not in line:
+                    match = re.search(r'original size:\s*([\d,]+)', line)
+                    if match and 'original_size' not in metrics:
                         metrics['original_size'] = int(match.group(1).replace(',', ''))
     except FileNotFoundError:
         pass
@@ -145,84 +262,92 @@ def compare_results():
     print("COMPRESSION COMPARISON RESULTS")
     print("=" * 80)
     
-    # Try to extract metrics from log files
-    standard_log = "compression.log"
-    rag_log = "rag_bgpt_compression.log"
-    comparison_log = "compression_comparison.log"
+    configs = [
+        ("Standard BGPT", "compression_standard.log"),
+        ("RAG BGPT", "compression_rag.log"),
+        ("JPEG (builtin)", "compression_jpeg.log"),
+        ("PNG (builtin)", "compression_png.log"),
+    ]
     
-    # Read all log files and extract metrics
-    all_logs = [standard_log, rag_log, comparison_log]
-    standard_metrics = {}
-    rag_metrics = {}
+    metrics_by_label = {}
+    for label, log_path in configs:
+        metrics = extract_compression_metrics_from_log(log_path)
+        if metrics:
+            metrics_by_label[label] = metrics
+            logger.info(f"Extracted metrics from {label} ({log_path})")
+        else:
+            logger.warning(f"No metrics found for {label} ({log_path})")
     
-    for log_file in all_logs:
-        if os.path.exists(log_file):
-            metrics = extract_compression_metrics_from_log(log_file)
-            # Determine which test this is from by checking context
-            with open(log_file, 'r') as f:
-                content = f.read()
-                if "STANDARD BGPT" in content or "BMP COMPRESSION TEST" in content:
-                    standard_metrics.update(metrics)
-                elif "RAG" in content or "RAG-ENHANCED" in content:
-                    rag_metrics.update(metrics)
+    if not metrics_by_label:
+        print("\n⚠ Could not extract metrics from any log files.")
+        print("Please ensure the comparison script ran successfully.")
+        print("=" * 80)
+        return
     
     print("\n" + "=" * 80)
     print("COMPRESSION COMPARISON SUMMARY")
     print("=" * 80)
-    print(f"\n{'Metric':<30} {'Standard BGPT':<20} {'RAG BGPT':<20} {'Difference':<20}")
-    print("-" * 90)
+    header = (
+        f"\n{'Method':<22}"
+        f"{'Ratio':>12}"
+        f"{'Rate':>12}"
+        f"{'Compressed':>15}"
+        f"{'Original':>15}"
+        f"{'Δ Ratio vs Std':>16}"
+        f"{'Δ Bytes vs Std':>18}"
+    )
+    print(header)
+    print("-" * len(header))
     
-    if standard_metrics and rag_metrics:
-        # Compression ratio (higher is better)
-        std_ratio = standard_metrics.get('ratio', 0)
-        rag_ratio = rag_metrics.get('ratio', 0)
-        ratio_diff = rag_ratio - std_ratio
-        ratio_pct = (ratio_diff / std_ratio * 100) if std_ratio > 0 else 0
-        print(f"{'Compression Ratio':<30} {std_ratio:<20.6f} {rag_ratio:<20.6f} {ratio_diff:+.6f} ({ratio_pct:+.2f}%)")
+    standard_metrics = metrics_by_label.get("Standard BGPT")
+    for label, _ in configs:
+        metrics = metrics_by_label.get(label)
+        if not metrics:
+            continue
+        ratio = metrics.get("ratio", 0)
+        rate = metrics.get("rate", 0)
+        compressed = metrics.get("compressed_size", 0)
+        original = metrics.get("original_size", 0)
         
-        # Compression rate (lower is better - percentage of original)
-        std_rate = standard_metrics.get('rate', 0)
-        rag_rate = rag_metrics.get('rate', 0)
-        rate_diff = rag_rate - std_rate
-        rate_pct = (rate_diff / std_rate * 100) if std_rate > 0 else 0
-        print(f"{'Compression Rate':<30} {std_rate:<20.6f} {rag_rate:<20.6f} {rate_diff:+.6f} ({rate_pct:+.2f}%)")
-        
-        # Compressed size
-        std_compressed = standard_metrics.get('compressed_size', 0)
-        rag_compressed = rag_metrics.get('compressed_size', 0)
-        size_diff = rag_compressed - std_compressed
-        size_pct = (size_diff / std_compressed * 100) if std_compressed > 0 else 0
-        print(f"{'Compressed Size (bytes)':<30} {std_compressed:<20,} {rag_compressed:<20,} {size_diff:+,} ({size_pct:+.2f}%)")
-        
-        # Original size (should be same)
-        std_original = standard_metrics.get('original_size', 0)
-        rag_original = rag_metrics.get('original_size', 0)
-        print(f"{'Original Size (bytes)':<30} {std_original:<20,} {rag_original:<20,}")
-        
-        print("\n" + "=" * 80)
-        print("INTERPRETATION:")
-        print("=" * 80)
-        if ratio_diff > 0:
-            print(f"✓ RAG compression achieved {ratio_diff:.6f} better compression ratio ({ratio_pct:+.2f}% improvement)")
-            print(f"  This means RAG compressed {abs(ratio_diff):.6f}x more effectively")
-        elif ratio_diff < 0:
-            print(f"✗ RAG compression achieved {abs(ratio_diff):.6f} worse compression ratio ({abs(ratio_pct):.2f}% worse)")
-            print(f"  Standard compression was {abs(ratio_diff):.6f}x more effective")
+        if standard_metrics and label != "Standard BGPT":
+            ratio_diff = ratio - standard_metrics.get("ratio", 0)
+            size_diff = compressed - standard_metrics.get("compressed_size", 0)
+            ratio_diff_str = f"{ratio_diff:+.6f}"
+            size_diff_str = f"{size_diff:+,}"
         else:
-            print("= Both methods achieved similar compression ratios")
+            ratio_diff_str = "-"
+            size_diff_str = "-"
         
-        if size_diff < 0:
-            print(f"✓ RAG produced {abs(size_diff):,} fewer bytes ({abs(size_pct):.2f}% smaller)")
-        elif size_diff > 0:
-            print(f"✗ RAG produced {size_diff:,} more bytes ({size_pct:.2f}% larger)")
-        else:
-            print("= Both methods produced the same compressed size")
+        print(
+            f"{label:<22}"
+            f"{ratio:>12.6f}"
+            f"{rate:>12.6f}"
+            f"{compressed:>15,}"
+            f"{original:>15,}"
+            f"{ratio_diff_str:>16}"
+            f"{size_diff_str:>18}"
+        )
+    
+    print("\n" + "=" * 80)
+    print("INTERPRETATION:")
+    print("=" * 80)
+    if standard_metrics:
+        std_ratio = standard_metrics.get("ratio", 0)
+        best_method = min(
+            metrics_by_label.items(),
+            key=lambda item: item[1].get("ratio", 1e9)
+        )
+        print(
+            f"Baseline (Standard BGPT) ratio: {std_ratio:.6f} "
+            f"({standard_metrics.get('compressed_size', 0):,} bytes)"
+        )
+        print(
+            f"Best ratio achieved by {best_method[0]}: "
+            f"{best_method[1]['ratio']:.6f} "
+            f"({best_method[1]['compressed_size']:,} bytes)"
+        )
     else:
-        print("\n⚠ Could not extract metrics from log files.")
-        print("Please check the log files manually:")
-        print(f"  - Standard: {standard_log}")
-        print(f"  - RAG: {rag_log}")
-        print(f"  - Comparison: {comparison_log}")
+        print("Standard BGPT metrics missing; shown values are absolute.")
     
     print("=" * 80)
 
@@ -249,6 +374,13 @@ def main():
         run_rag_compression()
     except Exception as e:
         logger.error(f"Error in RAG compression: {e}", exc_info=True)
+    
+    # Run builtin JPEG/PNG compression for comparison
+    try:
+        run_builtin_image_compression("JPEG", {"quality": 85, "optimize": True})
+        run_builtin_image_compression("PNG", {"optimize": True, "compress_level": 9})
+    except Exception as e:
+        logger.error(f"Error in builtin compression: {e}", exc_info=True)
     
     # Compare results
     compare_results()
